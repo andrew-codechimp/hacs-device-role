@@ -175,10 +175,11 @@ def test_upgrade_gap_uses_recorder_floor_on_restart(ha_bootstrap):
             assert state is not None
             assert float(state["state"]) == 40.0
 
-            # The raw recorder state itself must be 40.0 before we remove the custom store data.
+            # Simulate the upgrade restart: stop HA so recorder flushes the 40.0 raw value,
+            # then remove the stale custom persistence files before the next boot.
+            _docker("stop", CONTAINER_NAME)
             _assert_recorder_has_raw_state(config_dir, entity_id, "40.0")
 
-            _docker("stop", CONTAINER_NAME)
             _docker(
                 "run", "--rm",
                 "-v", f"{config_dir}:/config",

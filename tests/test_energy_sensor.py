@@ -7,10 +7,15 @@ from homeassistant.components.sensor import SensorDeviceClass, SensorStateClass
 from homeassistant.const import STATE_UNAVAILABLE, STATE_UNKNOWN, UnitOfEnergy
 from homeassistant.core import HomeAssistant, State
 from homeassistant.helpers import device_registry as dr, entity_registry as er
+from homeassistant.helpers.recorder import async_initialize_recorder
+from homeassistant.setup import async_setup_component
 
 from pytest_homeassistant_custom_component.common import (
     MockConfigEntry,
     mock_restore_cache_with_extra_data,
+)
+from pytest_homeassistant_custom_component.components.recorder.common import (
+    async_wait_recording_done,
 )
 
 from custom_components.device_role.accumulator import SessionAccumulator
@@ -315,6 +320,232 @@ async def test_energy_sensor_deferred_restore_floor_survives_commit_entry_accumu
     acc = store_manager._accumulators[f"{entry.entry_id}_sensor_energy"]
     assert acc.session_active is False
     assert acc.role_value == pytest.approx(30.0)
+
+
+@pytest.mark.usefixtures("enable_custom_integrations")
+async def test_energy_sensor_uses_recorder_floor_when_store_and_restore_missing(
+    hass: HomeAssistant,
+) -> None:
+    """A v0.4-style restart with no store or restore data is rescued by raw recorder history."""
+    async_initialize_recorder(hass)
+    assert await async_setup_component(hass, "recorder", {})
+
+    device, entity_entry = _setup_physical_energy_sensor(hass)
+    source_attrs = {
+        "unit_of_measurement": "kWh",
+        "device_class": "energy",
+        "state_class": "total_increasing",
+    }
+    hass.states.async_set(entity_entry.entity_id, "100.0", source_attrs)
+    hass.states.async_set("sensor.projector_energy", "30.0", source_attrs)
+    await async_wait_recording_done(hass)
+    hass.states.async_remove("sensor.projector_energy")
+    await hass.async_block_till_done()
+
+    entry = _make_energy_role(device.id, entity_entry.unique_id, entity_entry.entity_id)
+    entry.add_to_hass(hass)
+
+    mock_restore_cache_with_extra_data(hass, [])
+
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+
+    role_state = hass.states.get("sensor.projector_energy")
+    assert role_state is not None
+    assert float(role_state.state) == 30.0
+
+    hass.states.async_set(entity_entry.entity_id, "110.0", source_attrs)
+    await hass.async_block_till_done()
+
+    role_state = hass.states.get("sensor.projector_energy")
+    assert role_state is not None
+    assert float(role_state.state) == 40.0
+
+
+@pytest.mark.usefixtures("enable_custom_integrations")
+async def test_energy_sensor_prefers_newer_recorder_floor_for_stale_active_session(
+    hass: HomeAssistant,
+) -> None:
+    """A stale active session should reconcile to the newer recorder floor without dropping."""
+    async_initialize_recorder(hass)
+    assert await async_setup_component(hass, "recorder", {})
+
+    device, entity_entry = _setup_physical_energy_sensor(hass)
+    source_attrs = {
+        "unit_of_measurement": "kWh",
+        "device_class": "energy",
+        "state_class": "total_increasing",
+    }
+    hass.states.async_set("sensor.projector_energy", "30.0", source_attrs)
+    await async_wait_recording_done(hass)
+    hass.states.async_remove("sensor.projector_energy")
+    await hass.async_block_till_done()
+
+    entry = _make_energy_role(device.id, entity_entry.unique_id, entity_entry.entity_id)
+    entry.add_to_hass(hass)
+
+    stale_session = SessionAccumulator()
+    stale_session._historical_sum = 18.0
+    stale_session._session_start = 100.0
+    stale_session._last_physical = 110.0
+    stale_session._session_active = True
+    stale_session._unit = "kWh"
+
+    store_manager = hass.data.setdefault(DOMAIN, {}).get("store_manager")
+    if store_manager is None:
+        store_manager = AccumulatorStoreManager(hass)
+        hass.data[DOMAIN]["store_manager"] = store_manager
+    store_manager._accumulators[f"{entry.entry_id}_sensor_energy"] = stale_session
+    mock_restore_cache_with_extra_data(hass, [])
+
+    hass.states.async_set(entity_entry.entity_id, STATE_UNAVAILABLE, source_attrs)
+
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+
+    role_state = hass.states.get("sensor.projector_energy")
+    assert role_state is not None
+    assert role_state.state in (STATE_UNKNOWN, STATE_UNAVAILABLE)
+
+    hass.states.async_set(entity_entry.entity_id, "108.0", source_attrs)
+    await hass.async_block_till_done()
+
+    role_state = hass.states.get("sensor.projector_energy")
+    assert role_state is not None
+    assert float(role_state.state) == 30.0
+
+
+@pytest.mark.usefixtures("enable_custom_integrations")
+async def test_energy_sensor_uses_highest_trusted_floor_source(
+    hass: HomeAssistant,
+) -> None:
+    """The effective floor is the highest valid source: store, restore, then recorder."""
+    async_initialize_recorder(hass)
+    assert await async_setup_component(hass, "recorder", {})
+
+    device, entity_entry = _setup_physical_energy_sensor(hass)
+    source_attrs = {
+        "unit_of_measurement": "kWh",
+        "device_class": "energy",
+        "state_class": "total_increasing",
+    }
+    hass.states.async_set(entity_entry.entity_id, "50.0", source_attrs)
+    hass.states.async_set("sensor.projector_energy", "30.0", source_attrs)
+    await async_wait_recording_done(hass)
+    hass.states.async_remove("sensor.projector_energy")
+    await hass.async_block_till_done()
+
+    entry = _make_energy_role(device.id, entity_entry.unique_id, entity_entry.entity_id)
+    entry.add_to_hass(hass)
+
+    stale_session = SessionAccumulator()
+    stale_session._historical_sum = 20.0
+    stale_session._session_active = False
+    stale_session._unit = "kWh"
+
+    store_manager = hass.data.setdefault(DOMAIN, {}).get("store_manager")
+    if store_manager is None:
+        store_manager = AccumulatorStoreManager(hass)
+        hass.data[DOMAIN]["store_manager"] = store_manager
+    store_manager._accumulators[f"{entry.entry_id}_sensor_energy"] = stale_session
+
+    mock_restore_cache_with_extra_data(
+        hass,
+        [
+            (
+                State(
+                    "sensor.projector_energy",
+                    "25.0",
+                    source_attrs,
+                ),
+                {"native_value": 25.0, "native_unit_of_measurement": "kWh"},
+            )
+        ],
+    )
+
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+
+    role_state = hass.states.get("sensor.projector_energy")
+    assert role_state is not None
+    assert float(role_state.state) == 30.0
+
+
+@pytest.mark.usefixtures("enable_custom_integrations")
+async def test_energy_sensor_recorder_floor_is_clean_noop_without_history(
+    hass: HomeAssistant,
+) -> None:
+    """A role with no recorder history should continue using other floors without error."""
+    async_initialize_recorder(hass)
+    assert await async_setup_component(hass, "recorder", {})
+
+    device, entity_entry = _setup_physical_energy_sensor(hass)
+    entry = _make_energy_role(device.id, entity_entry.unique_id, entity_entry.entity_id)
+    entry.add_to_hass(hass)
+
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+
+    role_state = hass.states.get("sensor.projector_energy")
+    assert role_state is not None
+    assert role_state.state in (STATE_UNKNOWN, "0.0")
+
+
+@pytest.mark.usefixtures("enable_custom_integrations")
+async def test_energy_sensor_inactive_role_uses_newer_restore_or_recorder_floor(
+    hass: HomeAssistant,
+) -> None:
+    """Inactive roles still reconcile stale frozen state against newer restore or recorder floors."""
+    async_initialize_recorder(hass)
+    assert await async_setup_component(hass, "recorder", {})
+
+    device, entity_entry = _setup_physical_energy_sensor(hass)
+    source_attrs = {
+        "unit_of_measurement": "kWh",
+        "device_class": "energy",
+        "state_class": "total_increasing",
+    }
+    hass.states.async_set("sensor.projector_energy", "35.0", source_attrs)
+    await async_wait_recording_done(hass)
+    hass.states.async_remove("sensor.projector_energy")
+    await hass.async_block_till_done()
+
+    entry = _make_energy_role(
+        device.id, entity_entry.unique_id, entity_entry.entity_id, active=False
+    )
+    entry.add_to_hass(hass)
+
+    stale_session = SessionAccumulator()
+    stale_session._historical_sum = 15.0
+    stale_session._session_active = False
+    stale_session._unit = "kWh"
+
+    store_manager = hass.data.setdefault(DOMAIN, {}).get("store_manager")
+    if store_manager is None:
+        store_manager = AccumulatorStoreManager(hass)
+        hass.data[DOMAIN]["store_manager"] = store_manager
+    store_manager._accumulators[f"{entry.entry_id}_sensor_energy"] = stale_session
+
+    mock_restore_cache_with_extra_data(
+        hass,
+        [
+            (
+                State(
+                    "sensor.projector_energy",
+                    "25.0",
+                    source_attrs,
+                ),
+                {"native_value": 25.0, "native_unit_of_measurement": "kWh"},
+            )
+        ],
+    )
+
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+
+    role_state = hass.states.get("sensor.projector_energy")
+    assert role_state is not None
+    assert float(role_state.state) == 35.0
 
 
 @pytest.mark.usefixtures("enable_custom_integrations")

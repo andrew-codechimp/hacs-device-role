@@ -1,6 +1,8 @@
 # ABOUTME: E2E restart persistence tests for energy accumulator.
 # ABOUTME: Verifies accumulated energy survives real HA container restarts.
 
+import time
+
 import pytest
 
 from .conftest import _docker, CONTAINER_NAME, HA_IMAGE, HA_URL
@@ -53,6 +55,84 @@ def test_energy_accumulation_survives_restart(ha_client, restart_ha):
         "sensor.e2e_role_energy", "100.0", timeout=30,
     )
     assert state is not None
+
+
+@pytest.mark.usefixtures("ha_bootstrap")
+def test_upgrade_gap_uses_recorder_floor_on_restart(ha_client, ha_bootstrap):
+    """A v0.4-like restart should find its prior raw value in recorder history."""
+    config_dir = ha_bootstrap["config_dir"]
+
+    ha_client.call_service("fake_device", "set_value", {
+        "entity_id": "sensor.test_plug_energy",
+        "value": 100.0,
+    })
+    ha_client.wait_for_state("sensor.e2e_role_energy", "0.0", timeout=15)
+
+    ha_client.call_service("fake_device", "set_value", {
+        "entity_id": "sensor.test_plug_energy",
+        "value": 140.0,
+    })
+    state = ha_client.wait_for_state("sensor.e2e_role_energy", "40.0", timeout=15)
+    assert state is not None
+
+    # Simulate the v0.4 upgrade gap: custom accumulator store and restore cache are gone,
+    # but the old raw value still exists in Recorder's SQLite history.
+    _docker("stop", CONTAINER_NAME)
+    _docker(
+        "run", "--rm",
+        "-v", f"{config_dir}:/config",
+        HA_IMAGE,
+        "bash", "-c",
+        "rm -f /config/.storage/device_role_accumulators.json /config/.storage/core.restore_state",
+    )
+    _docker("start", CONTAINER_NAME)
+
+    client = HAClient(HA_URL)
+    try:
+        client.wait_for_ready(timeout=120)
+        client.onboard_and_authenticate()
+        client.wait_for_entity("sensor.e2e_role_energy", timeout=60)
+
+        deadline = time.monotonic() + 30
+        role_state = None
+        while time.monotonic() < deadline:
+            role_state = client.get_state("sensor.e2e_role_energy")
+            if role_state is not None:
+                try:
+                    value = float(role_state["state"])
+                except (TypeError, ValueError):
+                    value = -1.0
+                if value >= 40.0:
+                    break
+            time.sleep(1)
+
+        assert role_state is not None
+        assert float(role_state["state"]) >= 40.0, (
+            "Role should not publish below the recorder floor after restart when "
+            "store/restore data are absent"
+        )
+
+        client.call_service("fake_device", "set_value", {
+            "entity_id": "sensor.test_plug_energy",
+            "value": 160.0,
+        })
+        deadline = time.monotonic() + 30
+        role_state = None
+        while time.monotonic() < deadline:
+            role_state = client.get_state("sensor.e2e_role_energy")
+            if role_state is not None:
+                try:
+                    value = float(role_state["state"])
+                except (TypeError, ValueError):
+                    value = -1.0
+                if value >= 40.0:
+                    break
+            time.sleep(1)
+
+        assert role_state is not None
+        assert float(role_state["state"]) >= 40.0
+    finally:
+        client.close()
 
 
 @pytest.mark.usefixtures("ha_bootstrap")

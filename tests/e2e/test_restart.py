@@ -59,31 +59,18 @@ def test_energy_accumulation_survives_restart(ha_client, restart_ha):
 
 @pytest.mark.usefixtures("ha_bootstrap")
 def test_upgrade_gap_uses_recorder_floor_on_restart(ha_client, ha_bootstrap):
-    """A v0.4-like restart should find its prior raw value in recorder history."""
+    """A v0.4-like restart should restore from the last raw recorder value."""
     config_dir = ha_bootstrap["config_dir"]
 
-    ha_client.call_service("fake_device", "set_value", {
-        "entity_id": "sensor.test_plug_energy",
-        "value": 100.0,
-    })
-    ha_client.wait_for_state("sensor.e2e_role_energy", "0.0", timeout=15)
-
-    ha_client.call_service("fake_device", "set_value", {
-        "entity_id": "sensor.test_plug_energy",
-        "value": 140.0,
-    })
-    state = ha_client.wait_for_state("sensor.e2e_role_energy", "40.0", timeout=15)
-    assert state is not None
-
-    # Simulate the v0.4 upgrade gap: custom accumulator store and restore cache are gone,
-    # but the old raw value still exists in Recorder's SQLite history.
+    # Reset the shared HA state so this test starts from a known baseline instead
+    # of inheriting values produced by earlier tests in the same E2E session.
     _docker("stop", CONTAINER_NAME)
     _docker(
         "run", "--rm",
         "-v", f"{config_dir}:/config",
         HA_IMAGE,
         "bash", "-c",
-        "rm -f /config/.storage/device_role_accumulators.json /config/.storage/core.restore_state",
+        "rm -f /config/.storage/device_role_accumulators.json /config/.storage/core.restore_state && chmod -R a+rw /config/.storage",
     )
     _docker("start", CONTAINER_NAME)
 
@@ -93,44 +80,54 @@ def test_upgrade_gap_uses_recorder_floor_on_restart(ha_client, ha_bootstrap):
         client.onboard_and_authenticate()
         client.wait_for_entity("sensor.e2e_role_energy", timeout=60)
 
-        deadline = time.monotonic() + 30
-        role_state = None
-        while time.monotonic() < deadline:
-            role_state = client.get_state("sensor.e2e_role_energy")
-            if role_state is not None:
-                try:
-                    value = float(role_state["state"])
-                except (TypeError, ValueError):
-                    value = -1.0
-                if value >= 40.0:
-                    break
-            time.sleep(1)
-
-        assert role_state is not None
-        assert float(role_state["state"]) >= 40.0, (
-            "Role should not publish below the recorder floor after restart when "
-            "store/restore data are absent"
-        )
+        client.call_service("fake_device", "set_value", {
+            "entity_id": "sensor.test_plug_energy",
+            "value": 100.0,
+        })
+        client.wait_for_state("sensor.e2e_role_energy", "0.0", timeout=15)
 
         client.call_service("fake_device", "set_value", {
             "entity_id": "sensor.test_plug_energy",
-            "value": 160.0,
+            "value": 140.0,
         })
-        deadline = time.monotonic() + 30
-        role_state = None
-        while time.monotonic() < deadline:
-            role_state = client.get_state("sensor.e2e_role_energy")
-            if role_state is not None:
-                try:
-                    value = float(role_state["state"])
-                except (TypeError, ValueError):
-                    value = -1.0
-                if value >= 40.0:
-                    break
-            time.sleep(1)
+        state = client.wait_for_state("sensor.e2e_role_energy", "40.0", timeout=15)
+        assert state is not None
+        assert float(state["state"]) == 40.0
 
-        assert role_state is not None
-        assert float(role_state["state"]) >= 40.0
+        # Simulate the v0.4 upgrade gap: custom accumulator store and restore cache are gone,
+        # but the role's raw numeric state is still in Recorder history.
+        _docker("stop", CONTAINER_NAME)
+        _docker(
+            "run", "--rm",
+            "-v", f"{config_dir}:/config",
+            HA_IMAGE,
+            "bash", "-c",
+            "rm -f /config/.storage/device_role_accumulators.json /config/.storage/core.restore_state && chmod -R a+rw /config/.storage",
+        )
+        _docker("start", CONTAINER_NAME)
+
+        restart_client = HAClient(HA_URL)
+        try:
+            restart_client.wait_for_ready(timeout=120)
+            restart_client.onboard_and_authenticate()
+            restart_client.wait_for_entity("sensor.e2e_role_energy", timeout=60)
+
+            state = restart_client.wait_for_state("sensor.e2e_role_energy", "40.0", timeout=30)
+            assert state is not None
+            assert float(state["state"]) == 40.0, (
+                "Role should restore from the last raw recorder value when store and "
+                "restore data are absent"
+            )
+
+            restart_client.call_service("fake_device", "set_value", {
+                "entity_id": "sensor.test_plug_energy",
+                "value": 160.0,
+            })
+            state = restart_client.wait_for_state("sensor.e2e_role_energy", "200.0", timeout=30)
+            assert state is not None
+            assert float(state["state"]) == 200.0
+        finally:
+            restart_client.close()
     finally:
         client.close()
 

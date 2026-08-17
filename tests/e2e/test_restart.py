@@ -65,15 +65,6 @@ def _assert_recorder_has_raw_state(config_dir: Path, entity_id: str, expected: s
     )
 
 
-def _find_role_entity_id(config_dir: Path, config_entry_id: str) -> str:
-    """Return the entity_id created for a specific device_role config entry."""
-    entity_reg = read_storage_file(config_dir, "core.entity_registry")
-    for entry in (entity_reg or {}).get("data", {}).get("entities", []):
-        if entry.get("config_entry_id") == config_entry_id:
-            return entry["entity_id"]
-    raise RuntimeError(f"No role entity found for config entry {config_entry_id}")
-
-
 @pytest.mark.usefixtures("ha_bootstrap")
 def test_energy_accumulation_survives_restart(ha_client, restart_ha):
     """Energy accumulated before restart is preserved after restart."""
@@ -167,7 +158,7 @@ def test_upgrade_gap_uses_recorder_floor_on_restart(ha_bootstrap):
             client.wait_for_ready(timeout=120)
             client.onboard_and_authenticate()
 
-            entity_id = _find_role_entity_id(config_dir, config_entry_id)
+            entity_id = "sensor.upgrade_gap_energy"
             client.wait_for_entity(entity_id, timeout=60)
 
             client.call_service("fake_device", "set_value", {

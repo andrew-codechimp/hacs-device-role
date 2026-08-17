@@ -337,7 +337,7 @@ async def test_energy_sensor_waits_for_recorder_ready_before_history_floor(
     async_initialize_recorder(hass)
     assert await async_setup_component(hass, "recorder", {})
 
-    role_entity_id = "sensor.projector_energy"
+    role_entity_id = "sensor.projector_recorder_floor"
     hass.states.async_set(
         role_entity_id,
         "40.0",

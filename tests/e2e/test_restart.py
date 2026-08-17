@@ -16,39 +16,34 @@ from .seed import read_storage_file, write_storage_file
 pytestmark = [pytest.mark.e2e]
 
 
-def _backup_storage_files(config_dir: Path) -> dict[str, str | None]:
-    """Snapshot the shared HA .storage files this test mutates."""
+def _backup_upgrade_gap_storage(config_dir: Path) -> Path:
+    """Backup just the two files that the upgrade-gap test mutates."""
     backup_dir = config_dir / ".storage_upgrade_gap_backup"
     backup_dir.mkdir(exist_ok=True)
+    storage_dir = config_dir / ".storage"
 
-    original = {}
-    for name in ("core.config_entries", "device_role_accumulators.json", "core.restore_state"):
-        source = config_dir / ".storage" / name
+    for name in ("device_role_accumulators.json", "core.restore_state"):
+        source = storage_dir / name
         target = backup_dir / name
         if source.exists():
-            shutil.copy2(source, target)
-            original[name] = str(target)
-        else:
-            original[name] = None
-    return original
+            shutil.copyfile(source, target)
+    return backup_dir
 
 
-def _restore_storage_files(config_dir: Path, backup: dict[str, str | None]) -> None:
-    """Restore the shared HA .storage files for the rest of the E2E suite."""
+def _restore_upgrade_gap_storage(config_dir: Path, backup_dir: Path) -> None:
+    """Restore the exact upgrade-gap files and remove the temporary backup."""
     storage_dir = config_dir / ".storage"
     storage_dir.mkdir(exist_ok=True)
 
-    for name, target in backup.items():
+    for name in ("device_role_accumulators.json", "core.restore_state"):
+        source = backup_dir / name
         destination = storage_dir / name
-        if target is None:
-            if destination.exists():
-                destination.unlink()
-        else:
-            shutil.copy2(target, destination)
+        if source.exists():
+            shutil.copyfile(source, destination)
+        elif destination.exists():
+            destination.unlink()
 
-    backup_dir = config_dir / ".storage_upgrade_gap_backup"
-    if backup_dir.exists():
-        shutil.rmtree(backup_dir, ignore_errors=True)
+    shutil.rmtree(backup_dir, ignore_errors=True)
 
 
 def _assert_recorder_has_raw_state(config_dir: Path, entity_id: str, expected: str) -> None:
@@ -123,22 +118,9 @@ def test_energy_accumulation_survives_restart(ha_client, restart_ha):
 def test_upgrade_gap_uses_recorder_floor_on_restart(ha_client, ha_bootstrap):
     """A v0.4-like restart should restore from the last raw recorder value."""
     config_dir = ha_bootstrap["config_dir"]
-    backup = _backup_storage_files(config_dir)
+    backup_dir = _backup_upgrade_gap_storage(config_dir)
 
     try:
-        # Simulate a clean v0.4 upgrade baseline with the shared HA config left
-        # otherwise untouched. This test only mutates its own `.storage` files and
-        # restores them in finally so later E2E tests continue from the same shared state.
-        _docker("stop", CONTAINER_NAME)
-        _docker(
-            "run", "--rm",
-            "-v", f"{config_dir}:/config",
-            HA_IMAGE,
-            "bash", "-c",
-            "rm -f /config/.storage/device_role_accumulators.json /config/.storage/core.restore_state && chmod -R a+rw /config/.storage",
-        )
-        _docker("start", CONTAINER_NAME)
-
         client = HAClient(HA_URL)
         try:
             client.wait_for_ready(timeout=120)
@@ -159,12 +141,12 @@ def test_upgrade_gap_uses_recorder_floor_on_restart(ha_client, ha_bootstrap):
             assert state is not None
             assert float(state["state"]) == 40.0
 
-            # This is the real guardrail: the prior raw state must be present in
-            # the recorder DB before we delete the upgrade-gap storage files.
+            # This is the real guardrail: the last raw numeric role state must be in
+            # the recorder DB before the upgrade-gap files disappear.
             _assert_recorder_has_raw_state(config_dir, "sensor.e2e_role_energy", "40.0")
 
-            # Simulate the v0.4 upgrade gap: custom accumulator store and restore cache are gone,
-            # but Recorder still contains the last numeric raw state for the role.
+            # Simulate the v0.4 upgrade gap: custom accumulator store and restore state are
+            # absent, while the last raw role value remains in Recorder.
             _docker("stop", CONTAINER_NAME)
             _docker(
                 "run", "--rm",
@@ -190,21 +172,41 @@ def test_upgrade_gap_uses_recorder_floor_on_restart(ha_client, ha_bootstrap):
                     "restore data are absent"
                 )
 
+                # Controlled startup baseline: a new session starts at the current source value.
+                restart_client.call_service("fake_device", "set_value", {
+                    "entity_id": "sensor.test_plug_energy",
+                    "value": 100.0,
+                })
+                state = restart_client.wait_for_state(
+                    "sensor.e2e_role_energy", "40.0", timeout=15
+                )
+                assert state is not None
+                assert float(state["state"]) == 40.0
+
                 restart_client.call_service("fake_device", "set_value", {
                     "entity_id": "sensor.test_plug_energy",
                     "value": 160.0,
                 })
                 state = restart_client.wait_for_state(
-                    "sensor.e2e_role_energy", "200.0", timeout=30
+                    "sensor.e2e_role_energy", "100.0", timeout=30
                 )
                 assert state is not None
-                assert float(state["state"]) == 200.0
+                assert float(state["state"]) == 100.0
             finally:
                 restart_client.close()
         finally:
             client.close()
     finally:
-        _restore_storage_files(config_dir, backup)
+        _docker("stop", CONTAINER_NAME)
+        _docker(
+            "run", "--rm",
+            "-v", f"{config_dir}:/config",
+            HA_IMAGE,
+            "bash", "-c",
+            "chmod -R a+rw /config/.storage && for f in device_role_accumulators.json core.restore_state; do if [ -f /config/.storage_upgrade_gap_backup/$f ]; then cp /config/.storage_upgrade_gap_backup/$f /config/.storage/$f; else rm -f /config/.storage/$f; fi; done",
+        )
+        _docker("start", CONTAINER_NAME)
+        _restore_upgrade_gap_storage(config_dir, backup_dir)
 
 
 @pytest.mark.usefixtures("ha_bootstrap")

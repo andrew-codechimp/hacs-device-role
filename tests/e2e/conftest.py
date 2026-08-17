@@ -137,8 +137,8 @@ def config_dir():
     if not fake_dest.exists():
         shutil.copytree(FAKE_DEVICE_FIXTURE, fake_dest)
 
-    # Minimal configuration.yaml
-    (config_path / "configuration.yaml").write_text("homeassistant:\n")
+    # Minimal configuration.yaml with recorder enabled for the upgrade-gap proof.
+    (config_path / "configuration.yaml").write_text("homeassistant:\nrecorder:\n")
 
     yield config_path
 

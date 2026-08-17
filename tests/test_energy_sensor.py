@@ -1,8 +1,11 @@
 # ABOUTME: Tests for device_role accumulating sensor entities.
 # ABOUTME: Verifies accumulator integration, persistence, and frozen-when-inactive behavior.
 
+import asyncio
+
 import pytest
 
+from homeassistant.components import recorder
 from homeassistant.components.sensor import SensorDeviceClass, SensorStateClass
 from homeassistant.const import STATE_UNAVAILABLE, STATE_UNKNOWN, UnitOfEnergy
 from homeassistant.core import HomeAssistant, State
@@ -33,7 +36,10 @@ from custom_components.device_role.const import (
     DOMAIN,
 )
 from custom_components.device_role.role_manager import commit_entry_accumulators
-from custom_components.device_role.sensor import AccumulatorStoreManager
+from custom_components.device_role.sensor import (
+    AccumulatorStoreManager,
+    RoleAccumulatingSensor,
+)
 
 
 def _setup_physical_energy_sensor(hass: HomeAssistant):
@@ -320,6 +326,84 @@ async def test_energy_sensor_deferred_restore_floor_survives_commit_entry_accumu
     acc = store_manager._accumulators[f"{entry.entry_id}_sensor_energy"]
     assert acc.session_active is False
     assert acc.role_value == pytest.approx(30.0)
+
+
+@pytest.mark.usefixtures("enable_custom_integrations")
+async def test_energy_sensor_waits_for_recorder_ready_before_history_floor(
+    hass: HomeAssistant,
+) -> None:
+    """Recorder lookup must wait for startup readiness before reading the last raw state."""
+    async_initialize_recorder(hass)
+    assert await async_setup_component(hass, "recorder", {})
+
+    role_entity_id = "sensor.projector_energy"
+    hass.states.async_set(
+        role_entity_id,
+        "40.0",
+        {
+            "unit_of_measurement": "kWh",
+            "device_class": "energy",
+            "state_class": "total_increasing",
+        },
+    )
+    await async_wait_recording_done(hass)
+
+    instance = recorder.get_instance(hass)
+    deferred_ready = hass.loop.create_future()
+    instance.async_db_ready = deferred_ready
+
+    sensor = RoleAccumulatingSensor(
+        entry=_make_energy_role("device_1", "energy_1", "sensor.energy_raw"),
+        role_name="Projector",
+        slot="sensor_energy",
+        source_entity_id="sensor.energy_raw",
+        active=True,
+        accumulator=SessionAccumulator(),
+        store_manager=AccumulatorStoreManager(hass),
+        device_class_str="energy",
+        source_uom="kWh",
+    )
+    sensor.hass = hass
+    sensor.entity_id = role_entity_id
+    sensor._accumulator._unit = "kWh"
+    sensor._attr_native_unit_of_measurement = "kWh"
+
+    task = hass.async_create_task(sensor._async_get_recorder_floor())
+    await asyncio.sleep(0)
+    deferred_ready.set_result(True)
+
+    assert await task == 40.0
+
+
+@pytest.mark.usefixtures("enable_custom_integrations")
+async def test_energy_sensor_noops_when_recorder_ready_false(
+    hass: HomeAssistant,
+) -> None:
+    """A recorder instance that is not ready should never query history."""
+    async_initialize_recorder(hass)
+    assert await async_setup_component(hass, "recorder", {})
+
+    instance = recorder.get_instance(hass)
+    instance.async_db_ready = hass.loop.create_future()
+    instance.async_db_ready.set_result(False)
+
+    sensor = RoleAccumulatingSensor(
+        entry=_make_energy_role("device_1", "energy_1", "sensor.energy_raw"),
+        role_name="Projector",
+        slot="sensor_energy",
+        source_entity_id="sensor.energy_raw",
+        active=True,
+        accumulator=SessionAccumulator(),
+        store_manager=AccumulatorStoreManager(hass),
+        device_class_str="energy",
+        source_uom="kWh",
+    )
+    sensor.hass = hass
+    sensor.entity_id = "sensor.projector_energy"
+    sensor._accumulator._unit = "kWh"
+    sensor._attr_native_unit_of_measurement = "kWh"
+
+    assert await sensor._async_get_recorder_floor() is None
 
 
 @pytest.mark.usefixtures("enable_custom_integrations")

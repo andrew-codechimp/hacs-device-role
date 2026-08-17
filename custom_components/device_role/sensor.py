@@ -532,7 +532,10 @@ class RoleAccumulatingSensor(RestoreSensor):
         except KeyError:
             return None
 
-        if instance is None or not instance.async_db_ready.done():
+        if instance is None:
+            return None
+
+        if not await instance.async_db_ready:
             return None
 
         states_by_entity = await instance.async_add_executor_job(

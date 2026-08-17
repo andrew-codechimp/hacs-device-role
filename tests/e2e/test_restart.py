@@ -1,7 +1,6 @@
 # ABOUTME: E2E restart persistence tests for energy accumulator.
 # ABOUTME: Verifies accumulated energy survives real HA container restarts.
 
-import shutil
 import sqlite3
 import time
 from pathlib import Path
@@ -10,40 +9,36 @@ import pytest
 
 from .conftest import _docker, CONTAINER_NAME, HA_IMAGE, HA_URL
 from .ha_client import HAClient
-from .seed import read_storage_file, write_storage_file
+from .seed import make_device_role_entry, read_storage_file, write_storage_file
 
 
 pytestmark = [pytest.mark.e2e]
 
 
-def _backup_upgrade_gap_storage(config_dir: Path) -> Path:
-    """Backup just the two files that the upgrade-gap test mutates."""
-    backup_dir = config_dir / ".storage_upgrade_gap_backup"
-    backup_dir.mkdir(exist_ok=True)
-    storage_dir = config_dir / ".storage"
-
-    for name in ("device_role_accumulators.json", "core.restore_state"):
-        source = storage_dir / name
-        target = backup_dir / name
-        if source.exists():
-            shutil.copyfile(source, target)
-    return backup_dir
-
-
-def _restore_upgrade_gap_storage(config_dir: Path, backup_dir: Path) -> None:
-    """Restore the exact upgrade-gap files and remove the temporary backup."""
+def _backup_storage_snapshot(config_dir: Path, names: tuple[str, ...]) -> dict[str, dict | None]:
+    """Snapshot exact HA storage files the test mutates."""
+    snapshot = {}
     storage_dir = config_dir / ".storage"
     storage_dir.mkdir(exist_ok=True)
 
-    for name in ("device_role_accumulators.json", "core.restore_state"):
-        source = backup_dir / name
-        destination = storage_dir / name
-        if source.exists():
-            shutil.copyfile(source, destination)
-        elif destination.exists():
-            destination.unlink()
+    for name in names:
+        source = storage_dir / name
+        snapshot[name] = read_storage_file(config_dir, name)
+    return snapshot
 
-    shutil.rmtree(backup_dir, ignore_errors=True)
+
+def _restore_storage_snapshot(config_dir: Path, snapshot: dict[str, dict | None]) -> None:
+    """Restore exact HA storage files without touching unrelated test state."""
+    storage_dir = config_dir / ".storage"
+    storage_dir.mkdir(exist_ok=True)
+
+    for name, data in snapshot.items():
+        destination = storage_dir / name
+        if data is None:
+            if destination.exists():
+                destination.unlink()
+        else:
+            write_storage_file(config_dir, name, data)
 
 
 def _assert_recorder_has_raw_state(config_dir: Path, entity_id: str, expected: str) -> None:
@@ -68,6 +63,15 @@ def _assert_recorder_has_raw_state(config_dir: Path, entity_id: str, expected: s
     assert row[0] == expected, (
         f"Recorder raw state mismatch for {entity_id}: expected {expected}, got {row[0]}"
     )
+
+
+def _find_role_entity_id(config_dir: Path, config_entry_id: str) -> str:
+    """Return the entity_id created for a specific device_role config entry."""
+    entity_reg = read_storage_file(config_dir, "core.entity_registry")
+    for entry in (entity_reg or {}).get("data", {}).get("entities", []):
+        if entry.get("config_entry_id") == config_entry_id:
+            return entry["entity_id"]
+    raise RuntimeError(f"No role entity found for config entry {config_entry_id}")
 
 
 @pytest.mark.usefixtures("ha_bootstrap")
@@ -115,81 +119,118 @@ def test_energy_accumulation_survives_restart(ha_client, restart_ha):
 
 
 @pytest.mark.usefixtures("ha_bootstrap")
-def test_upgrade_gap_uses_recorder_floor_on_restart(ha_client, ha_bootstrap):
+def test_upgrade_gap_uses_recorder_floor_on_restart(ha_bootstrap):
     """A v0.4-like restart should restore from the last raw recorder value."""
     config_dir = ha_bootstrap["config_dir"]
-    backup_dir = _backup_upgrade_gap_storage(config_dir)
+    device_id = ha_bootstrap["device_id"]
+    config_entry_id = "device_role_e2e_upgrade_gap"
+    role_name = "Upgrade Gap"
+    source_entity_id = "sensor.test_plug_energy"
+    source_unique_id = ha_bootstrap["entities"][source_entity_id]["unique_id"]
+    mapping = {
+        "slot": "sensor_energy",
+        "source_unique_id": source_unique_id,
+        "source_entity_id": source_entity_id,
+        "domain": "sensor",
+        "device_class": "energy",
+        "state_class": "total_increasing",
+    }
+
+    config_entries = read_storage_file(config_dir, "core.config_entries")
+    snapshot = _backup_storage_snapshot(
+        config_dir,
+        ("core.config_entries", "core.device_registry", "core.entity_registry", "device_role_accumulators.json", "core.restore_state"),
+    )
+    config_entries["data"]["entries"].append(
+        make_device_role_entry(
+            entry_id=config_entry_id,
+            role_name=role_name,
+            device_id=device_id,
+            entity_mappings=[mapping],
+        )
+    )
 
     try:
+        _docker("stop", CONTAINER_NAME)
+        _docker(
+            "run", "--rm",
+            "-v", f"{config_dir}:/config",
+            HA_IMAGE,
+            "bash", "-c",
+            "chmod -R a+rw /config/.storage",
+        )
+        write_storage_file(config_dir, "core.config_entries", config_entries)
+        _docker("start", CONTAINER_NAME)
+
         client = HAClient(HA_URL)
         try:
             client.wait_for_ready(timeout=120)
             client.onboard_and_authenticate()
-            client.wait_for_entity("sensor.e2e_role_energy", timeout=60)
+
+            entity_id = _find_role_entity_id(config_dir, config_entry_id)
+            client.wait_for_entity(entity_id, timeout=60)
 
             client.call_service("fake_device", "set_value", {
-                "entity_id": "sensor.test_plug_energy",
+                "entity_id": source_entity_id,
                 "value": 100.0,
             })
-            client.wait_for_state("sensor.e2e_role_energy", "0.0", timeout=15)
+            client.wait_for_state(entity_id, "0.0", timeout=15)
 
             client.call_service("fake_device", "set_value", {
-                "entity_id": "sensor.test_plug_energy",
+                "entity_id": source_entity_id,
                 "value": 140.0,
             })
-            state = client.wait_for_state("sensor.e2e_role_energy", "40.0", timeout=15)
+            state = client.wait_for_state(entity_id, "40.0", timeout=15)
             assert state is not None
             assert float(state["state"]) == 40.0
 
-            # This is the real guardrail: the last raw numeric role state must be in
-            # the recorder DB before the upgrade-gap files disappear.
-            _assert_recorder_has_raw_state(config_dir, "sensor.e2e_role_energy", "40.0")
+            # The raw recorder state itself must be 40.0 before we remove the custom store data.
+            _assert_recorder_has_raw_state(config_dir, entity_id, "40.0")
 
-            # Simulate the v0.4 upgrade gap: custom accumulator store and restore state are
-            # absent, while the last raw role value remains in Recorder.
             _docker("stop", CONTAINER_NAME)
             _docker(
                 "run", "--rm",
                 "-v", f"{config_dir}:/config",
                 HA_IMAGE,
                 "bash", "-c",
-                "rm -f /config/.storage/device_role_accumulators.json /config/.storage/core.restore_state && chmod -R a+rw /config/.storage",
+                "chmod -R a+rw /config/.storage",
             )
+            accum_state = read_storage_file(config_dir, "device_role_accumulators.json") or {
+                "data": {"accumulators": {}}
+            }
+            accum_state.setdefault("data", {})
+            accum_state["data"].setdefault("accumulators", {})
+            accum_state["data"]["accumulators"].pop(f"{config_entry_id}_sensor_energy", None)
+            write_storage_file(config_dir, "device_role_accumulators.json", accum_state)
+            restore_state_path = config_dir / ".storage" / "core.restore_state"
+            if restore_state_path.exists():
+                restore_state_path.unlink()
             _docker("start", CONTAINER_NAME)
 
             restart_client = HAClient(HA_URL)
             try:
                 restart_client.wait_for_ready(timeout=120)
                 restart_client.onboard_and_authenticate()
-                restart_client.wait_for_entity("sensor.e2e_role_energy", timeout=60)
+                restart_client.wait_for_entity(entity_id, timeout=60)
 
-                state = restart_client.wait_for_state(
-                    "sensor.e2e_role_energy", "40.0", timeout=30
-                )
+                state = restart_client.wait_for_state(entity_id, "40.0", timeout=30)
                 assert state is not None
                 assert float(state["state"]) == 40.0, (
                     "Role should restore from the last raw recorder value when store and "
                     "restore data are absent"
                 )
 
-                # Controlled startup baseline: a new session starts at the current source value.
                 restart_client.call_service("fake_device", "set_value", {
-                    "entity_id": "sensor.test_plug_energy",
+                    "entity_id": source_entity_id,
                     "value": 100.0,
                 })
-                state = restart_client.wait_for_state(
-                    "sensor.e2e_role_energy", "40.0", timeout=15
-                )
-                assert state is not None
-                assert float(state["state"]) == 40.0
+                restart_client.wait_for_state(entity_id, "40.0", timeout=15)
 
                 restart_client.call_service("fake_device", "set_value", {
-                    "entity_id": "sensor.test_plug_energy",
+                    "entity_id": source_entity_id,
                     "value": 160.0,
                 })
-                state = restart_client.wait_for_state(
-                    "sensor.e2e_role_energy", "100.0", timeout=30
-                )
+                state = restart_client.wait_for_state(entity_id, "100.0", timeout=30)
                 assert state is not None
                 assert float(state["state"]) == 100.0
             finally:
@@ -203,10 +244,10 @@ def test_upgrade_gap_uses_recorder_floor_on_restart(ha_client, ha_bootstrap):
             "-v", f"{config_dir}:/config",
             HA_IMAGE,
             "bash", "-c",
-            "chmod -R a+rw /config/.storage && for f in device_role_accumulators.json core.restore_state; do if [ -f /config/.storage_upgrade_gap_backup/$f ]; then cp /config/.storage_upgrade_gap_backup/$f /config/.storage/$f; else rm -f /config/.storage/$f; fi; done",
+            "chmod -R a+rw /config/.storage",
         )
+        _restore_storage_snapshot(config_dir, snapshot)
         _docker("start", CONTAINER_NAME)
-        _restore_upgrade_gap_storage(config_dir, backup_dir)
 
 
 @pytest.mark.usefixtures("ha_bootstrap")

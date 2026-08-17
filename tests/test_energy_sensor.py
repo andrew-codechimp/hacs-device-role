@@ -6,6 +6,7 @@ import asyncio
 import pytest
 
 from homeassistant.components import recorder
+from homeassistant.components.recorder import history
 from homeassistant.components.sensor import SensorDeviceClass, SensorStateClass
 from homeassistant.const import STATE_UNAVAILABLE, STATE_UNKNOWN, UnitOfEnergy
 from homeassistant.core import HomeAssistant, State
@@ -349,6 +350,11 @@ async def test_energy_sensor_waits_for_recorder_ready_before_history_floor(
     await async_wait_recording_done(hass)
 
     instance = recorder.get_instance(hass)
+    query = await instance.async_add_executor_job(
+        history.get_last_state_changes, hass, 1, role_entity_id
+    )
+    assert query[role_entity_id][-1].state == "40.0"
+
     deferred_ready = hass.loop.create_future()
     instance.async_db_ready = deferred_ready
 
@@ -370,8 +376,8 @@ async def test_energy_sensor_waits_for_recorder_ready_before_history_floor(
 
     task = hass.async_create_task(sensor._async_get_recorder_floor())
     await asyncio.sleep(0)
+    assert not task.done()
     deferred_ready.set_result(True)
-
     assert await task == 40.0
 
 
